@@ -41,11 +41,13 @@ class MCPClient:
         if server_script_path.endswith('.py'):
             # Use uv run to ensure the server runs in its own virtual environment
             server_dir = os.path.dirname(os.path.abspath(server_script_path))
+            script_name = os.path.basename(server_script_path)
             
             # Check if server directory has uv project files
             if os.path.exists(os.path.join(server_dir, 'uv.lock')) or os.path.exists(os.path.join(server_dir, 'pyproject.toml')):
                 command = "uv"
-                args = ["run", "python", server_script_path]
+                # Use --directory to run from the server's directory
+                args = ["run", "--directory", server_dir, "python", script_name]
             else:
                 command = "python"
                 args = [server_script_path]
@@ -85,24 +87,62 @@ class MCPClient:
         
         content = result.content
         
-        # Handle list of content blocks
+        # Handle list of content blocks - collect ALL content, not just first
         if isinstance(content, list) and len(content) > 0:
-            first_content = content[0]
-            # Check if it's a TextContent object with text attribute
-            if hasattr(first_content, 'text'):
-                return first_content.text
-            # Check if it's a dict with text key
-            elif isinstance(first_content, dict) and 'text' in first_content:
-                return first_content['text']
-            # Check if it's already a string
-            elif isinstance(first_content, str):
-                return first_content
-            # Try to convert to string
+            extracted_parts = []
+            for content_block in content:
+                # Check if it's a TextContent object with text attribute
+                if hasattr(content_block, 'text'):
+                    text = content_block.text
+                    # Try to parse as JSON if it looks like JSON
+                    try:
+                        parsed = json.loads(text)
+                        extracted_parts.append(parsed)
+                    except (json.JSONDecodeError, TypeError):
+                        extracted_parts.append(text)
+                # Check if it's a dict with text key
+                elif isinstance(content_block, dict):
+                    if 'text' in content_block:
+                        text = content_block['text']
+                        # Try to parse as JSON if it looks like JSON
+                        try:
+                            parsed = json.loads(text)
+                            extracted_parts.append(parsed)
+                        except (json.JSONDecodeError, TypeError):
+                            extracted_parts.append(text)
+                    else:
+                        # If it's a dict without 'text', it might be the data itself
+                        extracted_parts.append(content_block)
+                # Check if it's already a string
+                elif isinstance(content_block, str):
+                    # Try to parse as JSON
+                    try:
+                        parsed = json.loads(content_block)
+                        extracted_parts.append(parsed)
+                    except (json.JSONDecodeError, TypeError):
+                        extracted_parts.append(content_block)
+                # Try to convert to string
+                else:
+                    extracted_parts.append(str(content_block))
+            
+            # If we have multiple parts, combine them appropriately
+            if len(extracted_parts) == 1:
+                return extracted_parts[0]
             else:
-                return str(first_content)
+                # If all parts are lists, flatten them
+                if all(isinstance(p, list) for p in extracted_parts):
+                    flattened = []
+                    for p in extracted_parts:
+                        flattened.extend(p)
+                    return flattened
+                return extracted_parts
         # Handle direct content (string or dict)
         elif isinstance(content, str):
-            return content
+            # Try to parse as JSON
+            try:
+                return json.loads(content)
+            except (json.JSONDecodeError, TypeError):
+                return content
         elif isinstance(content, dict):
             return content
         else:
@@ -114,6 +154,19 @@ class MCPClient:
         try:
             result = await self.session.call_tool(tool_name, tool_args)
             extracted_result = self._extract_tool_result(result)
+            
+            # Debug: print raw result structure (can be removed later)
+            # print(f"[DEBUG] Tool {tool_name} returned: {type(extracted_result)} = {extracted_result}")
+            
+            # If the result is a string that looks like JSON, try to parse it
+            if isinstance(extracted_result, str):
+                try:
+                    parsed = json.loads(extracted_result)
+                    return {"result": parsed}
+                except (json.JSONDecodeError, TypeError):
+                    # Not JSON, return as string
+                    return {"result": extracted_result}
+            
             return {"result": extracted_result}
         except Exception as e:
             print(f"[Error executing tool {tool_name}: {e}]")
