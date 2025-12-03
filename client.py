@@ -40,10 +40,24 @@ class MCPClient:
 
         # Determine whether the server script is written in Python or JavaScript
         # This allows us to execute the correct command to start the MCP server
-        command = "python" if server_script_path.endswith('.py') else "node"
+        if server_script_path.endswith('.py'):
+            # Use uv run to ensure the server runs in its own virtual environment
+            # This handles cases where the server has its own dependencies
+            import os
+            server_dir = os.path.dirname(os.path.abspath(server_script_path))
+            # Check if server directory has uv project files
+            if os.path.exists(os.path.join(server_dir, 'uv.lock')) or os.path.exists(os.path.join(server_dir, 'pyproject.toml')):
+                command = "uv"
+                args = ["run", "python", server_script_path]
+            else:
+                command = "python"
+                args = [server_script_path]
+        else:
+            command = "node"
+            args = [server_script_path]
 
         # Define the parameters for connecting to the MCP server
-        server_params = StdioServerParameters(command=command, args=[server_script_path])
+        server_params = StdioServerParameters(command=command, args=args)
 
         # Establish communication with the MCP server using standard input/output (stdio)
         stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
