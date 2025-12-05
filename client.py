@@ -1,170 +1,204 @@
-# Import necessary libraries
-import asyncio  # For handling asynchronous operations
-import os       # For environment variable access
-import sys      # For system-specific parameters and functions
-import json     # For handling JSON data (used when printing function declarations)
+"""
+MCP Client Implementation
+A client that connects to MCP servers and enables LLMs to use tools via function calling.
 
-# Import MCP client components
-from typing import Optional  # For type hinting optional values
-from contextlib import AsyncExitStack  # For managing multiple async tasks
-from mcp import ClientSession, StdioServerParameters  # MCP session management
-from mcp.client.stdio import stdio_client  # MCP client for standard I/O communication
+This implementation uses Google Gemini as the LLM provider and communicates with
+MCP servers through stdio (standard input/output).
+"""
 
-# Import Google's Gen AI SDK
+# Standard library imports
+import asyncio
+import os
+import sys
+import json
+
+# MCP SDK imports
+from typing import Optional
+from contextlib import AsyncExitStack
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+# Google Gemini AI imports
 from google import genai
 from google.genai import types
 from google.genai.types import Tool, FunctionDeclaration
 from google.genai.types import GenerateContentConfig
-from dotenv import load_dotenv  # For loading API keys from a .env file
 
-# Load environment variables from .env file
+# Environment management
+from dotenv import load_dotenv
+
 load_dotenv()
 
 class MCPClient:
+    """
+    MCP Client that bridges LLMs with MCP servers for tool execution.
+    
+    This client:
+    - Connects to MCP servers via stdio
+    - Processes user queries through Gemini AI
+    - Executes tool calls requested by the LLM
+    - Maintains conversation history for context
+    """
+    
     def __init__(self):
-        """Initialize the MCP client and configure the Gemini API."""
-        self.session: Optional[ClientSession] = None  # MCP session for communication
-        self.exit_stack = AsyncExitStack()  # Manages async resource cleanup
-        self.conversation_history = []  # Maintain conversation history
+        """Initialize the MCP client with Gemini AI configuration."""
+        # MCP session management
+        self.session: Optional[ClientSession] = None
+        self.exit_stack = AsyncExitStack()
         
-        # Retrieve the Gemini API key from environment variables
+        # Conversation state
+        self.conversation_history = []
+        
+        # Load and validate API key
         gemini_api_key = os.getenv("GEMINI_API_KEY")
         if not gemini_api_key:
             raise ValueError("GEMINI_API_KEY not found. Please add it to your .env file.")
 
-        # Configure the Gemini AI client
+        # Initialize Gemini client
         self.genai_client = genai.Client(api_key=gemini_api_key)
 
     async def connect_to_server(self, server_script_path: str):
-        """Connect to the MCP server and list available tools."""
-        # Determine whether the server script is written in Python or JavaScript
+        """
+        Establish connection to an MCP server and discover available tools.
+        
+        Supports Python servers (with or without uv) and Node.js servers.
+        Uses stdio for bidirectional communication with the server subprocess.
+        """
+        # Determine command based on server type
         if server_script_path.endswith('.py'):
-            # Use uv run to ensure the server runs in its own virtual environment
             server_dir = os.path.dirname(os.path.abspath(server_script_path))
             script_name = os.path.basename(server_script_path)
             
-            # Check if server directory has uv project files
+            # Use uv if the server has uv project files for dependency isolation
             if os.path.exists(os.path.join(server_dir, 'uv.lock')) or os.path.exists(os.path.join(server_dir, 'pyproject.toml')):
                 command = "uv"
-                # Use --directory to run from the server's directory
                 args = ["run", "--directory", server_dir, "python", script_name]
             else:
                 command = "python"
                 args = [server_script_path]
         else:
+            # Assume Node.js for non-Python files
             command = "node"
             args = [server_script_path]
 
-        # Define the parameters for connecting to the MCP server
+        # Configure server subprocess parameters
         server_params = StdioServerParameters(command=command, args=args)
 
-        # Establish communication with the MCP server using standard input/output (stdio)
+        # Start server and establish stdio communication
         stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
-
-        # Extract the read/write streams from the transport object
         self.stdio, self.write = stdio_transport
 
-        # Initialize the MCP client session, which allows interaction with the server
+        # Create MCP session for high-level server interaction
         self.session = await self.exit_stack.enter_async_context(ClientSession(self.stdio, self.write))
 
-        # Send an initialization request to the MCP server
+        # Initialize MCP protocol handshake
         await self.session.initialize()
 
-        # Request the list of available tools from the MCP server
+        # Discover available tools from server
         response = await self.session.list_tools()
-        tools = response.tools  # Extract the tool list from the response
-
-        # Print a message showing the names of the tools available on the server
+        tools = response.tools
         print("\nConnected to server with tools:", [tool.name for tool in tools])
 
-        # Convert MCP tools to Gemini format
+        # Convert MCP tool format to Gemini's function calling format
         self.function_declarations = convert_mcp_tools_to_gemini(tools)
 
     def _extract_tool_result(self, result):
-        """Extract content from MCP tool result, handling different formats."""
+        """
+        Extract and normalize content from MCP tool results.
+        
+        MCP servers can return data in various formats:
+        - TextContent objects with .text attribute
+        - Dictionaries with 'text' key
+        - Raw strings (possibly JSON-encoded)
+        - Lists of content blocks
+        
+        This method handles all formats and attempts JSON parsing where applicable.
+        """
         if not result or not hasattr(result, 'content'):
             return None
         
         content = result.content
         
-        # Handle list of content blocks - collect ALL content, not just first
+        # Case 1: List of content blocks
         if isinstance(content, list) and len(content) > 0:
             extracted_parts = []
+            
             for content_block in content:
-                # Check if it's a TextContent object with text attribute
+                # TextContent object with .text attribute
                 if hasattr(content_block, 'text'):
                     text = content_block.text
-                    # Try to parse as JSON if it looks like JSON
                     try:
-                        parsed = json.loads(text)
-                        extracted_parts.append(parsed)
+                        extracted_parts.append(json.loads(text))
                     except (json.JSONDecodeError, TypeError):
                         extracted_parts.append(text)
-                # Check if it's a dict with text key
+                
+                # Dictionary with 'text' key
                 elif isinstance(content_block, dict):
                     if 'text' in content_block:
                         text = content_block['text']
-                        # Try to parse as JSON if it looks like JSON
                         try:
-                            parsed = json.loads(text)
-                            extracted_parts.append(parsed)
+                            extracted_parts.append(json.loads(text))
                         except (json.JSONDecodeError, TypeError):
                             extracted_parts.append(text)
                     else:
-                        # If it's a dict without 'text', it might be the data itself
                         extracted_parts.append(content_block)
-                # Check if it's already a string
+                
+                # Plain string
                 elif isinstance(content_block, str):
-                    # Try to parse as JSON
                     try:
-                        parsed = json.loads(content_block)
-                        extracted_parts.append(parsed)
+                        extracted_parts.append(json.loads(content_block))
                     except (json.JSONDecodeError, TypeError):
                         extracted_parts.append(content_block)
-                # Try to convert to string
+                
+                # Fallback: convert to string
                 else:
                     extracted_parts.append(str(content_block))
             
-            # If we have multiple parts, combine them appropriately
+            # Return single item unwrapped, or combine multiple parts
             if len(extracted_parts) == 1:
                 return extracted_parts[0]
+            elif all(isinstance(p, list) for p in extracted_parts):
+                # Flatten if all parts are lists
+                flattened = []
+                for p in extracted_parts:
+                    flattened.extend(p)
+                return flattened
             else:
-                # If all parts are lists, flatten them
-                if all(isinstance(p, list) for p in extracted_parts):
-                    flattened = []
-                    for p in extracted_parts:
-                        flattened.extend(p)
-                    return flattened
                 return extracted_parts
-        # Handle direct content (string or dict)
+        
+        # Case 2: Direct string content
         elif isinstance(content, str):
-            # Try to parse as JSON
             try:
                 return json.loads(content)
             except (json.JSONDecodeError, TypeError):
                 return content
+        
+        # Case 3: Direct dict content
         elif isinstance(content, dict):
             return content
+        
+        # Case 4: Fallback for unknown types
         else:
-            # Fallback: convert to string
             return str(content) if content else None
 
     async def _execute_tool_call(self, tool_name: str, tool_args: dict):
-        """Execute a tool call and return the result in a format suitable for Gemini."""
+        """
+        Execute a tool via the MCP server and format the result for Gemini.
+        
+        Returns a dict with 'result' key (or 'error' on failure) as expected by Gemini's
+        function calling protocol.
+        """
         try:
+            # Call the tool through MCP session
             result = await self.session.call_tool(tool_name, tool_args)
             extracted_result = self._extract_tool_result(result)
             
-            # Debug: print raw result structure (can be removed later)
-            # print(f"[DEBUG] Tool {tool_name} returned: {type(extracted_result)} = {extracted_result}")
-            
-            # If the result is a string that looks like JSON, try to parse it
+            # Additional JSON parsing attempt for string results
             if isinstance(extracted_result, str):
                 try:
                     parsed = json.loads(extracted_result)
                     return {"result": parsed}
                 except (json.JSONDecodeError, TypeError):
-                    # Not JSON, return as string
                     return {"result": extracted_result}
             
             return {"result": extracted_result}
@@ -174,22 +208,26 @@ class MCPClient:
 
     async def process_query(self, query: str) -> str:
         """
-        Process a user query using the Gemini API and execute tool calls if needed.
-        Args:
-            query (str): The user's input query.
-        Returns:
-            str: The response generated by the Gemini model.
+        Process user query through Gemini with automatic tool execution.
+        
+        Flow:
+        1. Send query + conversation history to Gemini
+        2. If Gemini requests tool calls, execute them via MCP
+        3. Send tool results back to Gemini
+        4. Repeat until Gemini returns a text response
+        5. Return final response to user
+        
+        This implements the "agentic loop" where the LLM can chain multiple
+        tool calls autonomously to accomplish complex tasks.
         """
-        # Format user input as a structured Content object for Gemini
+        # Format and store user message
         user_prompt_content = types.Content(
             role='user',
             parts=[types.Part.from_text(text=query)]
         )
-        
-        # Add user message to conversation history
         self.conversation_history.append(user_prompt_content)
 
-        # Send user input to Gemini AI and include available tools for function calling
+        # Initial LLM call with full context
         response = self.genai_client.models.generate_content(
             model='gemini-2.0-flash-001',
             contents=self.conversation_history,
@@ -198,46 +236,42 @@ class MCPClient:
             ),
         )
 
-        # Initialize variables to store final response text
         final_text = []
-        max_iterations = 10  # Prevent infinite loops
+        max_iterations = 10
         iteration = 0
 
-        # Process the response - handle multiple function calls and follow-up responses
+        # Agentic loop: handle tool calls until we get a final text response
         while iteration < max_iterations:
             iteration += 1
             function_calls_made = False
             
-            # Process all candidates in the response
+            # Parse response for function calls or text
             for candidate in response.candidates:
                 if candidate.content.parts:
                     for part in candidate.content.parts:
                         if isinstance(part, types.Part):
                             if part.function_call:
-                                # Extract function call details
+                                # LLM requested a tool call
                                 function_call_part = part
                                 tool_name = function_call_part.function_call.name
                                 tool_args = function_call_part.function_call.args
 
-                                # Print debug info
                                 print(f"\n[Gemini requested tool call: {tool_name} with args {tool_args}]")
 
-                                # Execute the tool using the MCP server
+                                # Execute tool via MCP
                                 function_response = await self._execute_tool_call(tool_name, tool_args)
 
-                                # Format the tool response for Gemini
+                                # Format tool result for Gemini
                                 function_response_part = types.Part.from_function_response(
                                     name=tool_name,
                                     response=function_response
                                 )
-
-                                # Structure the tool response as a Content object for Gemini
                                 function_response_content = types.Content(
                                     role='tool',
                                     parts=[function_response_part]
                                 )
 
-                                # Add function call and response to conversation history
+                                # Update conversation history with call + result
                                 self.conversation_history.append(
                                     types.Content(role='model', parts=[function_call_part])
                                 )
@@ -245,15 +279,15 @@ class MCPClient:
                                 
                                 function_calls_made = True
                             else:
-                                # Direct text response (no function call)
+                                # LLM returned text (final response)
                                 if hasattr(part, 'text') and part.text:
                                     final_text.append(part.text)
             
-            # If no function calls were made, we're done
+            # Exit loop if no tools were called
             if not function_calls_made:
                 break
             
-            # Get follow-up response from Gemini after tool execution
+            # Get next response from Gemini with updated context
             response = self.genai_client.models.generate_content(
                 model='gemini-2.0-flash-001',
                 contents=self.conversation_history,
@@ -262,7 +296,7 @@ class MCPClient:
                 ),
             )
 
-        # Add final response to conversation history
+        # Store final response in history
         if final_text:
             response_text = "\n".join(final_text)
             self.conversation_history.append(
@@ -272,90 +306,110 @@ class MCPClient:
                 )
             )
 
-        # Return the combined response as a single formatted string
         return "\n".join(final_text) if final_text else "No response generated."
 
     def clear_history(self):
-        """Clear the conversation history."""
+        """Reset conversation history for a fresh context."""
         self.conversation_history = []
 
     async def chat_loop(self):
-        """Run an interactive chat session with the user."""
+        """
+        Interactive CLI for the MCP client.
+        
+        Commands:
+        - 'quit': Exit the client
+        - 'clear': Clear conversation history
+        - Any other input: Process as a query
+        """
         print("\nMCP Client Started! Type 'quit' to exit, 'clear' to clear history.")
         while True:
             query = input("\nQuery: ").strip()
+            
             if query.lower() == 'quit':
                 break
+            
             if query.lower() == 'clear':
                 self.clear_history()
                 print("Conversation history cleared.")
                 continue
             
-            # Process the user's query and display the response
             response = await self.process_query(query)
             print("\n" + response)
 
     async def cleanup(self):
-        """Clean up resources before exiting."""
+        """Close MCP session and clean up async resources."""
         await self.exit_stack.aclose()
 
 def clean_schema(schema):
     """
-    Recursively removes 'title' fields from the JSON schema.
-    Args:
-        schema (dict): The schema dictionary.
-    Returns:
-        dict: Cleaned schema without 'title' fields.
+    Remove 'title' fields from JSON Schema recursively.
+    
+    Some LLM providers have issues with 'title' fields in JSON Schema.
+    This function removes them while preserving all other schema properties.
     """
     if isinstance(schema, dict):
-        schema.pop("title", None)  # Remove title if present
+        schema.pop("title", None)
+        
         # Recursively clean nested properties
         if "properties" in schema and isinstance(schema["properties"], dict):
             for key in schema["properties"]:
                 schema["properties"][key] = clean_schema(schema["properties"][key])
+    
     return schema
 
 def convert_mcp_tools_to_gemini(mcp_tools):
     """
-    Converts MCP tool definitions to the correct format for Gemini API function calling.
+    Convert MCP tool definitions to Gemini's function calling format.
+    
+    MCP uses JSON Schema for tool parameters. Gemini requires FunctionDeclaration
+    objects wrapped in Tool objects. This function bridges the two formats.
+    
     Args:
-        mcp_tools (list): List of MCP tool objects with 'name', 'description', and 'inputSchema'.
+        mcp_tools: List of MCP tool objects (name, description, inputSchema)
+    
     Returns:
-        list: List of Gemini Tool objects with properly formatted function declarations.
+        List of Gemini Tool objects ready for function calling
     """
     gemini_tools = []
+    
     for tool in mcp_tools:
-        # Ensure inputSchema is a valid JSON schema and clean it
-        parameters = clean_schema(tool.inputSchema.copy() if hasattr(tool.inputSchema, 'copy') else tool.inputSchema)
+        # Copy and clean the JSON Schema
+        parameters = clean_schema(
+            tool.inputSchema.copy() if hasattr(tool.inputSchema, 'copy') else tool.inputSchema
+        )
 
-        # Construct the function declaration
+        # Create Gemini function declaration
         function_declaration = FunctionDeclaration(
             name=tool.name,
             description=tool.description,
             parameters=parameters
         )
 
-        # Wrap in a Tool object
+        # Wrap in Tool object (Gemini's required format)
         gemini_tool = Tool(function_declarations=[function_declaration])
         gemini_tools.append(gemini_tool)
 
     return gemini_tools
 
 async def main():
-    """Main function to start the MCP client."""
+    """
+    Main entry point for the MCP client.
+    
+    Usage: python client.py <path_to_server_script>
+    
+    Example: python client.py ../my-server/server.py
+    """
     if len(sys.argv) < 2:
         print("Usage: python client.py <path_to_server_script>")
         sys.exit(1)
 
     client = MCPClient()
     try:
-        # Connect to the MCP server and start the chat loop
         await client.connect_to_server(sys.argv[1])
         await client.chat_loop()
     finally:
-        # Ensure resources are cleaned up
         await client.cleanup()
 
+
 if __name__ == "__main__":
-    # Run the main function within the asyncio event loop
     asyncio.run(main())
